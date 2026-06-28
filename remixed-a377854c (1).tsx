@@ -24,6 +24,7 @@ const TOOLS = [
   {id:"exec",icon:"🧭",name:"Executive Function Coach",desc:"For neurodivergent minds. Think out loud, externalise tasks, find calm clarity."},
   {id:"charge",icon:"🌊",name:"Reducing the Charge",desc:"Process emotional resistance and release what you're carrying, gently."},
   {id:"clarity",icon:"🧿",name:"Clarity Compass",desc:"A guided process for decisions that actually feel like yours."},
+  {id:"tasks",icon:"✅",name:"Task Assistant",desc:"Add, organise, and bulk-edit your tasks by chatting. Say \"undo\" anytime."},
 
 ];
 
@@ -332,6 +333,112 @@ function ClarityCoach({onBack,onCrisis}){
 
 
 
+// ── TASK ASSISTANT ─────────────────────────────────────────────────────────
+const TASK_KEY="pf_exec_list"; // shared with Executive Function Coach
+let idSeq=0;
+const uid=()=>"t"+Date.now().toString(36)+(idSeq++);
+const normTasks=arr=>(arr||[]).map(x=>x&&typeof x==="object"?{id:x.id||uid(),text:x.text??"",done:!!x.done}:{id:uid(),text:String(x),done:false});
+const extractJSON=raw=>{const a=raw.indexOf("{"),b=raw.lastIndexOf("}");if(a<0||b<=a)throw new Error("no json");return JSON.parse(raw.slice(a,b+1));};
+const applyOps=(tasks,ops)=>{
+  let next=[...tasks];
+  for(const o of ops||[]){
+    if(o.op==="add"&&o.text!=null) next.push({id:uid(),text:String(o.text),done:false});
+    else if(o.op==="delete") next=next.filter(t=>t.id!==o.id);
+    else if(o.op==="update") next=next.map(t=>t.id===o.id?{...t,...(o.text!=null?{text:String(o.text)}:{}),...(o.done!=null?{done:!!o.done}:{})}:t);
+    else if(o.op==="clear_completed") next=next.filter(t=>!t.done);
+  }
+  return next;
+};
+const taskSys=tasks=>`You are a friendly task management assistant. The user speaks naturally; you translate their request into structured operations on their task list.
+
+CURRENT TASK LIST (use these exact ids for delete/update):
+${tasks.length?tasks.map(t=>`- id:${t.id} | [${t.done?"x":" "}] ${t.text}`).join("\n"):"(empty)"}
+
+Respond with ONLY a JSON object — no prose, no markdown fences:
+{"reply":"<one short friendly sentence about what you did>","ops":[...]}
+
+Valid ops:
+- {"op":"add","text":"..."}                                  add a new task
+- {"op":"delete","id":"..."}                                 remove a task by its id
+- {"op":"update","id":"...","text":"...","done":true|false}  edit text and/or completion (omit fields you aren't changing)
+- {"op":"clear_completed"}                                   remove all completed tasks
+- {"op":"undo"}                                              revert the most recent change
+
+Rules:
+- For bulk requests emit MULTIPLE ops (e.g. "mark these three done" = three update ops).
+- Only reference ids that exist in the list above. If a task can't be found, say so in reply with "ops":[].
+- If the user is just asking a question or chatting, give a helpful reply with "ops":[].
+- Keep reply under 20 words.${SAFETY}`;
+
+function TaskAssistant({onBack,onCrisis}){
+  const [tasks,setTasks]=useState([]);
+  const [msgs,setMsgs]=useState([{role:"assistant",text:"Hi! Tell me what to add, change, or remove — e.g. \"add buy milk and call the dentist\" or \"mark the gym one done\". Say \"undo\" anytime.",ts:now()}]);
+  const [input,setInput]=useState("");const [loading,setLoading]=useState(false);const [showList,setShowList]=useState(true);
+  const undoStack=useRef([]);const [canUndo,setCanUndo]=useState(false);
+
+  useEffect(()=>{(async()=>{try{const r=await window.storage.get(TASK_KEY);if(r?.value)setTasks(normTasks(JSON.parse(r.value)));}catch{}})();},[]);
+
+  const persist=async t=>{setTasks(t);try{await window.storage.set(TASK_KEY,JSON.stringify(t));}catch{}};
+  const pushUndo=cur=>{undoStack.current=[...undoStack.current,cur].slice(-20);setCanUndo(true);};
+  const doUndo=async announce=>{
+    if(!undoStack.current.length){if(announce)setMsgs(p=>[...p,{role:"assistant",text:"Nothing to undo.",ts:now()}]);return false;}
+    const prev=undoStack.current[undoStack.current.length-1];
+    undoStack.current=undoStack.current.slice(0,-1);setCanUndo(undoStack.current.length>0);
+    await persist(prev);
+    if(announce)setMsgs(p=>[...p,{role:"assistant",text:"Reverted the last change.",ts:now()}]);
+    return true;
+  };
+
+  const send=async text=>{
+    if(detectCrisis(text))onCrisis();
+    const hist=[...msgs,{role:"user",text}].slice(-12).map(m=>({role:m.role,content:m.text||m.content}));
+    while(hist.length&&hist[0].role!=="user")hist.shift();
+    setMsgs(p=>[...p,{role:"user",text,ts:now()}]);setLoading(true);
+    try{
+      const raw=await api(hist,taskSys(tasks));
+      let data;try{data=extractJSON(raw);}catch{setMsgs(p=>[...p,{role:"assistant",text:"I didn't quite get that — try rephrasing?",ts:now()}]);setLoading(false);return;}
+      const ops=Array.isArray(data.ops)?data.ops:[];
+      if(ops.some(o=>o.op==="undo")){
+        const ok=await doUndo(false);
+        setMsgs(p=>[...p,{role:"assistant",text:ok?(data.reply||"Reverted the last change."):"Nothing to undo.",ts:now()}]);
+      }else if(ops.length){
+        pushUndo(tasks);await persist(applyOps(tasks,ops));
+        setMsgs(p=>[...p,{role:"assistant",text:data.reply||"Done.",ts:now()}]);
+      }else{
+        setMsgs(p=>[...p,{role:"assistant",text:data.reply||"Okay.",ts:now()}]);
+      }
+    }catch{setMsgs(p=>[...p,{role:"assistant",text:"Something went wrong.",ts:now()}]);}
+    setLoading(false);
+  };
+
+  const toggle=i=>{pushUndo(tasks);persist(tasks.map((t,j)=>j===i?{...t,done:!t.done}:t));};
+  const remove=i=>{pushUndo(tasks);persist(tasks.filter((_,j)=>j!==i));};
+
+  const open=tasks.filter(t=>!t.done).length;
+  const extra=<>
+    <button onClick={()=>doUndo(true)} disabled={!canUndo} style={{fontSize:12,color:canUndo?"#666":"#ccc",background:"none",border:"1px solid #ddd",borderRadius:6,padding:"4px 10px",cursor:canUndo?"pointer":"default"}}>↶ Undo</button>
+    <button onClick={()=>setShowList(s=>!s)} style={{fontSize:12,color:"#666",background:"none",border:"1px solid #ddd",borderRadius:6,padding:"4px 10px",cursor:"pointer"}}>{showList?"Hide list":"My list"}{open>0&&` (${open})`}</button>
+  </>;
+
+  return(
+    <Chat header={<Hdr icon="✅" name="Task Assistant" sub="Manage tasks by chatting" extra={extra} onBack={onBack} onCrisis={onCrisis}/>} messages={msgs} input={input} setInput={setInput} onSend={send} loading={loading} onCrisis={onCrisis}>
+      {showList&&(
+        <div style={{background:"#fffdf9",border:"1px solid #e4ddd4",borderRadius:10,padding:14,margin:"4px 0"}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#7a6f62",letterSpacing:0.5,marginBottom:8}}>MY TASKS</div>
+          {tasks.length===0&&<div style={{fontSize:13,color:"#bbb",fontStyle:"italic"}}>No tasks yet — tell me what to add.</div>}
+          {tasks.map((t,i)=>(
+            <div key={t.id} style={{display:"flex",alignItems:"center",gap:10,marginBottom:7}}>
+              <input type="checkbox" checked={!!t.done} onChange={()=>toggle(i)} style={{accentColor:"#7a9e7e",cursor:"pointer"}}/>
+              <span style={{fontSize:13,flex:1,textDecoration:t.done?"line-through":"none",color:t.done?"#bbb":"#2c2c2c"}}>{t.text}</span>
+              <button onClick={()=>remove(i)} style={{background:"none",border:"none",color:"#ddd",cursor:"pointer",fontSize:14}}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Chat>
+  );
+}
+
 // ── HOME ───────────────────────────────────────────────────────────────────
 function Home({onSelect,onCrisis}){
   return(
@@ -389,6 +496,7 @@ export default function App(){
       {screen==="exec"&&<ExecCoach {...cp}/>}
       {screen==="charge"&&<ChargeCoach {...cp}/>}
       {screen==="clarity"&&<ClarityCoach {...cp}/>}
+      {screen==="tasks"&&<TaskAssistant {...cp}/>}
 
     </>
   );
