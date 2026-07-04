@@ -27,6 +27,14 @@ const TOOLS = [
 
 ];
 
+// Shared task store — the "AI addon" the coaching hub integrates with. In the
+// production app (MadeHappen / ZTD) this is the real task list behind /api/coach;
+// here it's persisted locally so the prototype demonstrates the same behaviour:
+// coaches capture next steps straight into the tasks the assistant manages.
+const TASKS_KEY = "pf_tasks";
+async function loadTasks(){try{const r=await window.storage.get(TASKS_KEY);if(r?.value)return JSON.parse(r.value);}catch{}return [];}
+async function saveTasks(t){try{await window.storage.set(TASKS_KEY,JSON.stringify(t));}catch{}return t;}
+
 // ── CRISIS OVERLAY ─────────────────────────────────────────────────────────
 function CrisisOverlay({onClose}){
   return(
@@ -217,7 +225,13 @@ function ExecCoach({onBack,onCrisis}){
       const r=await api(next.map(m=>({role:m.role,content:m.text||m.content})),EXEC_SYS);
       setMsgs(p=>[...p,{role:"assistant",text:r,ts:now()}]);
       const raw=await api([{role:"user",content:`From this exchange, extract any tasks or intentions mentioned. Return ONLY a JSON array of short strings, or [].\n\nUser: ${text}\nCoach: ${r}`}],"Extract tasks. Return ONLY a JSON array. No markdown.");
-      try{const items=JSON.parse(raw);if(items.length)saveList([...new Set([...checklist,...items])]);}catch{}
+      try{const items=JSON.parse(raw);if(items.length){saveList([...new Set([...checklist,...items])]);
+        // Integration: also push captured tasks into the shared task store the
+        // Task Assistant manages, so they're actionable in one place.
+        const cur=await loadTasks();const have=new Set(cur.map(t=>(t.text||"").toLowerCase()));
+        const fresh=items.filter(x=>x&&!have.has(String(x).toLowerCase())).map(x=>({text:String(x),done:false}));
+        if(fresh.length)await saveTasks([...cur,...fresh]);
+      }}catch{}
     }catch{setMsgs(p=>[...p,{role:"assistant",text:"Something went wrong.",ts:now()}]);}
     setLoading(false);
   };
@@ -332,15 +346,76 @@ function ClarityCoach({onBack,onCrisis}){
 
 
 
+// ── TASK ASSISTANT (the AI addon) ───────────────────────────────────────────
+// Natural-language add / complete / delete over the shared task store. This is
+// the "AI addon" the coaching hub integrates with — the same idea as
+// MadeHappen's /api/chat assistant, so tasks captured in coaching are actionable
+// in the same place.
+const ASSIST_SYS=`You manage a user's to-do list through natural language. Given the CURRENT TASKS and the user's message, decide what to change. Respond ONLY with JSON: {"reply":"one short friendly sentence","add":["task text",...],"complete":[index,...],"delete":[index,...]}. Indices are 0-based into CURRENT TASKS. Use empty arrays when nothing changes. No markdown, no prose outside the JSON.`;
+
+function TaskAssistant({onBack,onCrisis}){
+  const [tasks,setTasks]=useState([]);
+  const [msgs,setMsgs]=useState([{role:"assistant",text:"Hi! I can add, complete and delete your tasks. Try “add buy milk and call the dentist” or “delete the second one”.",ts:now()}]);
+  const [input,setInput]=useState("");const [loading,setLoading]=useState(false);const [showList,setShowList]=useState(true);
+
+  useEffect(()=>{(async()=>{setTasks(await loadTasks());})();},[]);
+  const persist=async t=>{setTasks(t);await saveTasks(t);};
+
+  const send=async text=>{
+    if(detectCrisis(text))onCrisis();
+    const um={role:"user",text,ts:now()};setMsgs(p=>[...p,um]);setLoading(true);
+    const listStr=tasks.length?tasks.map((t,i)=>`${i}. ${t.text}${t.done?" (done)":""}`).join("\n"):"(empty)";
+    try{
+      const raw=await api([{role:"user",content:`CURRENT TASKS:\n${listStr}\n\nMESSAGE: ${text}`}],ASSIST_SYS);
+      let a={reply:"Done.",add:[],complete:[],delete:[]};
+      try{a={...a,...JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0]||raw)};}catch{}
+      let next=tasks.map(t=>({...t}));
+      (a.complete||[]).forEach(i=>{if(next[i])next[i].done=true;});
+      next=next.filter((_,i)=>!(a.delete||[]).includes(i));
+      (a.add||[]).forEach(txt=>{if(txt&&txt.trim())next.push({text:txt.trim(),done:false});});
+      await persist(next);
+      setMsgs(p=>[...p,{role:"assistant",text:a.reply||"Done.",ts:now()}]);
+    }catch{setMsgs(p=>[...p,{role:"assistant",text:"Something went wrong.",ts:now()}]);}
+    setLoading(false);
+  };
+
+  const open=tasks.filter(t=>!t.done).length;
+  const extra=<button onClick={()=>setShowList(s=>!s)} style={{fontSize:12,color:"#666",background:"none",border:"1px solid #ddd",borderRadius:6,padding:"4px 10px",cursor:"pointer",position:"relative"}}>{showList?"Hide list":"My tasks"}{open>0&&<span style={{position:"absolute",top:-6,right:-6,background:"#f97316",color:"white",borderRadius:999,fontSize:10,padding:"1px 5px"}}>{open}</span>}</button>;
+
+  return(
+    <Chat header={<Hdr icon="✨" name="Task Assistant" sub="Add · complete · delete" extra={extra} onBack={onBack} onCrisis={onCrisis}/>} messages={msgs} input={input} setInput={setInput} onSend={send} loading={loading} onCrisis={onCrisis}>
+      {showList&&(
+        <div style={{background:"#fff8f1",border:"1px solid #f4dcc4",borderRadius:10,padding:14,margin:"4px 0"}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#9a6b3f",letterSpacing:0.5,marginBottom:8}}>YOUR TASKS</div>
+          {tasks.length===0&&<div style={{fontSize:13,color:"#bbb",fontStyle:"italic"}}>No tasks yet. Add some, or let a coach capture them for you.</div>}
+          {tasks.map((item,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:7}}>
+              <input type="checkbox" checked={!!item.done} onChange={()=>persist(tasks.map((x,j)=>j===i?{...x,done:!x.done}:x))} style={{accentColor:"#f97316",cursor:"pointer"}}/>
+              <span style={{fontSize:13,flex:1,textDecoration:item.done?"line-through":"none",color:item.done?"#bbb":"#2c2c2c"}}>{item.text}</span>
+              <button onClick={()=>persist(tasks.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:"#ddd",cursor:"pointer",fontSize:14}}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Chat>
+  );
+}
+
 // ── HOME ───────────────────────────────────────────────────────────────────
 function Home({onSelect,onCrisis}){
   return(
     <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",fontFamily:"Georgia,serif",background:"#f8f7f4"}}>
       <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"32px 20px"}}>
         <div style={{fontSize:11,letterSpacing:2,color:"#a0aec0",textTransform:"uppercase",marginBottom:10}}>Purposefields</div>
-        <h1 style={{fontSize:24,fontWeight:600,color:"#2d3748",marginBottom:8}}>Coaching Hub</h1>
-        <p style={{color:"#718096",fontSize:14,marginBottom:36,textAlign:"center",maxWidth:360,lineHeight:1.7}}>Choose a coaching space. Each session is private and learns from you over time.</p>
+        <h1 style={{fontSize:24,fontWeight:600,color:"#2d3748",marginBottom:8}}>AI Hub</h1>
+        <p style={{color:"#718096",fontSize:14,marginBottom:36,textAlign:"center",maxWidth:380,lineHeight:1.7}}>Manage your tasks, or step into a coaching space. Coaches capture next steps straight into your task list.</p>
         <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%",maxWidth:440}}>
+          <button onClick={()=>onSelect("assistant")} style={{display:"flex",alignItems:"center",gap:14,padding:"16px 18px",background:"linear-gradient(135deg,#fff7ed,#ffffff)",border:"1px solid #f4c99a",borderRadius:12,cursor:"pointer",textAlign:"left",boxShadow:"0 1px 3px rgba(0,0,0,0.05)"}}>
+            <span style={{fontSize:24,lineHeight:1,flexShrink:0}}>✨</span>
+            <div style={{flex:1}}><div style={{fontWeight:600,fontSize:14,color:"#2d3748",marginBottom:2}}>Task Assistant</div><div style={{fontSize:13,color:"#718096",lineHeight:1.6}}>Add, complete and organise your tasks in plain language.</div></div>
+            <span style={{fontSize:18,color:"#f97316"}}>→</span>
+          </button>
+          <div style={{fontSize:11,fontWeight:600,letterSpacing:1,color:"#a0aec0",textTransform:"uppercase",margin:"8px 2px 2px"}}>Coaching, resilience & focus</div>
           {TOOLS.map(t=>(
             <button key={t.id} onClick={()=>onSelect(t.id)} style={{display:"flex",alignItems:"flex-start",gap:14,padding:"16px 18px",background:"white",border:"1px solid #e2e8f0",borderRadius:12,cursor:"pointer",textAlign:"left",boxShadow:"0 1px 3px rgba(0,0,0,0.05)"}}>
               <span style={{fontSize:24,lineHeight:1,flexShrink:0}}>{t.icon}</span>
@@ -384,6 +459,7 @@ export default function App(){
     <>
       {crisis&&<CrisisOverlay onClose={()=>setCrisis(false)}/>}
       {screen==="home"&&<Home onSelect={setScreen} onCrisis={()=>setCrisis(true)}/>}
+      {screen==="assistant"&&<TaskAssistant {...cp}/>}
       {screen==="cbt"&&<CBTCoach {...cp}/>}
       {screen==="action"&&<ActionCoach {...cp}/>}
       {screen==="exec"&&<ExecCoach {...cp}/>}
