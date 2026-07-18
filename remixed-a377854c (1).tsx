@@ -18,6 +18,35 @@ const api = async (messages, system, retries=2, delay=1500) => {
 const now = () => new Date().toLocaleTimeString("en-AU",{hour:"2-digit",minute:"2-digit"});
 const bold = t => t.split(/(\*\*[^*]+\*\*)/g).map((p,i)=>p.startsWith("**")&&p.endsWith("**")?<strong key={i}>{p.slice(2,-2)}</strong>:p);
 
+// ── VOICE MODE ───────────────────────────────────────────────────────────────
+// Browser-native text-to-speech (with a choice of voices) + speech-to-text
+// dictation via the Web Speech API. No backend or API key — same idea as the
+// production app's voice mode, so coaching can be listened to and spoken to.
+const _synth = typeof window!=="undefined" ? window.speechSynthesis : null;
+const _SR = typeof window!=="undefined" ? (window.SpeechRecognition||window.webkitSpeechRecognition) : null;
+const speakable = t => (t||"").replace(/\*\*/g,"").replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu,"").replace(/\s+/g," ").trim();
+
+function useVoice(){
+  const [voices,setVoices]=useState([]);
+  const [enabled,setEnabled]=useState(()=>{try{return localStorage.getItem("pf_voice_on")==="1";}catch{return false;}});
+  const [voiceURI,setURI]=useState(()=>{try{return localStorage.getItem("pf_voice_uri")||"";}catch{return "";}});
+  const [rate,setRateS]=useState(()=>{try{return parseFloat(localStorage.getItem("pf_voice_rate"))||1;}catch{return 1;}});
+  const [speaking,setSpeaking]=useState(false);const [listening,setListening]=useState(false);
+  const recRef=useRef(null);
+
+  useEffect(()=>{if(!_synth)return;const load=()=>{const all=_synth.getVoices()||[];const en=all.filter(v=>/^en([-_]|$)/i.test(v.lang));setVoices(en.length?en:all);};load();if(_synth.addEventListener)_synth.addEventListener("voiceschanged",load);return()=>{if(_synth.removeEventListener)_synth.removeEventListener("voiceschanged",load);};},[]);
+  const set=(k,val,f)=>{f(val);try{localStorage.setItem(k,val);}catch{}};
+  const setVoiceURI=u=>set("pf_voice_uri",u,setURI);
+  const setRate=r=>set("pf_voice_rate",String(r),v=>setRateS(parseFloat(v)));
+  const stop=()=>{if(_synth)_synth.cancel();setSpeaking(false);};
+  const speak=t=>{if(!_synth)return;const body=speakable(t);if(!body)return;_synth.cancel();const u=new SpeechSynthesisUtterance(body);const v=(_synth.getVoices()||[]).find(x=>x.voiceURI===voiceURI);if(v){u.voice=v;u.lang=v.lang;}u.rate=rate;u.onstart=()=>setSpeaking(true);u.onend=()=>setSpeaking(false);u.onerror=()=>setSpeaking(false);_synth.speak(u);};
+  const toggle=()=>setEnabled(p=>{const n=!p;try{localStorage.setItem("pf_voice_on",n?"1":"0");}catch{}if(!n&&_synth)_synth.cancel();return n;});
+  const listen=onFinal=>{if(!_SR)return;try{const r=new _SR();r.lang="en-AU";r.interimResults=false;r.maxAlternatives=1;r.onresult=e=>{const t=e.results?.[0]?.[0]?.transcript||"";if(t)onFinal(t);};r.onend=()=>setListening(false);r.onerror=()=>setListening(false);recRef.current=r;setListening(true);r.start();}catch{setListening(false);}};
+  const stopListen=()=>{try{recRef.current?.stop();}catch{}setListening(false);};
+  useEffect(()=>()=>{if(_synth)_synth.cancel();try{recRef.current?.abort?.();}catch{}},[]);
+  return {supported:!!_synth,sttSupported:!!_SR,voices,enabled,toggle,voiceURI,setVoiceURI,rate,setRate,speaking,speak,stop,listening,listen,stopListen};
+}
+
 const TOOLS = [
   {id:"cbt",icon:"🌿",name:"CBT Coach",desc:"A structured 10-step CBT session to work through what's troubling you."},
   {id:"action",icon:"⚡",name:"Action Coach",desc:"For when you know what to do but can't start. Uncover resistance, rebuild momentum."},
@@ -94,8 +123,12 @@ function ConsentGate({onAccept,onCrisis}){
 // ── CHAT SHELL ─────────────────────────────────────────────────────────────
 function Chat({header,children,messages,input,setInput,onSend,loading,onCrisis,inputDisabled}){
   const bottomRef=useRef(null);const inputRef=useRef(null);
+  const v=useVoice();const [showVoice,setShowVoice]=useState(false);const spokenRef=useRef(0);
   useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[messages,loading]);
-  const send=()=>{if(!input.trim()||loading||inputDisabled)return;onSend(input.trim());setInput("");};
+  // Read each new assistant message aloud when voice mode is on.
+  useEffect(()=>{if(!v.enabled)return;const last=messages[messages.length-1];if(last&&last.role==="assistant"&&messages.length>spokenRef.current){spokenRef.current=messages.length;v.speak(last.text||last.content);}},[messages,v.enabled]);
+  const send=()=>{if(!input.trim()||loading||inputDisabled)return;v.stop();onSend(input.trim());setInput("");};
+  const vbtn={background:"none",border:"1px solid #e2e8f0",borderRadius:8,padding:"6px 10px",fontSize:13,cursor:"pointer",fontFamily:"Georgia,serif",color:"#4a5568"};
   return(
     <div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"Georgia,serif",maxWidth:700,margin:"0 auto"}}>
       {header}
@@ -112,8 +145,21 @@ function Chat({header,children,messages,input,setInput,onSend,loading,onCrisis,i
         {children}
         <div ref={bottomRef}/>
       </div>
+      {v.supported&&showVoice&&(
+        <div style={{padding:"10px 14px",borderTop:"1px solid #eef0f2",background:"#faf9f7",display:"flex",flexWrap:"wrap",gap:10,alignItems:"center"}}>
+          <button onClick={v.toggle} style={{...vbtn,background:v.enabled?"#4a7c59":"none",color:v.enabled?"#fff":"#4a5568",border:v.enabled?"1px solid #4a7c59":"1px solid #e2e8f0"}}>{v.enabled?"🔈 Voice on":"🔇 Voice off"}</button>
+          <select value={v.voiceURI} onChange={e=>v.setVoiceURI(e.target.value)} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"6px 8px",fontSize:13,fontFamily:"Georgia,serif",color:"#2d3748",background:"#fff",maxWidth:180}}>
+            <option value="">Default voice</option>
+            {v.voices.map(vo=><option key={vo.voiceURI} value={vo.voiceURI}>{vo.name}{vo.lang?` (${vo.lang})`:""}</option>)}
+          </select>
+          <label style={{fontSize:12,color:"#718096",display:"flex",alignItems:"center",gap:6}}>Speed<input type="range" min="0.7" max="1.3" step="0.05" value={v.rate} onChange={e=>v.setRate(e.target.value)} style={{accentColor:"#4a7c59"}}/></label>
+          <button onClick={()=>v.speaking?v.stop():v.speak("Hi, this is how I sound.")} style={vbtn}>{v.speaking?"⏹ Stop":"▶ Preview"}</button>
+        </div>
+      )}
       <div style={{padding:"12px 14px",borderTop:"1px solid #e2e8f0",background:"#fff",display:"flex",gap:10,alignItems:"flex-end"}}>
-        <textarea ref={inputRef} value={input} onChange={e=>{setInput(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Type your response…" disabled={loading||inputDisabled} rows={1} style={{flex:1,resize:"none",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 13px",fontSize:14,fontFamily:"Georgia,serif",lineHeight:1.5,outline:"none",overflow:"hidden",color:"#2d3748",background:"#f8f7f4"}}/>
+        {v.supported&&<button onClick={()=>setShowVoice(s=>!s)} title="Voice options" style={{background:showVoice?"#eef2ef":"none",border:"1px solid #e2e8f0",borderRadius:10,padding:"10px 12px",fontSize:15,cursor:"pointer"}}>{v.enabled?"🔈":"🔊"}</button>}
+        {v.sttSupported&&<button onClick={()=>v.listening?v.stopListen():v.listen(t=>setInput(input?`${input} ${t}`:t))} title={v.listening?"Stop":"Speak"} disabled={loading||inputDisabled} style={{background:v.listening?"#e05252":"none",border:v.listening?"1px solid #e05252":"1px solid #e2e8f0",color:v.listening?"#fff":"#4a5568",borderRadius:10,padding:"10px 12px",fontSize:15,cursor:"pointer"}}>{v.listening?"⏺":"🎤"}</button>}
+        <textarea ref={inputRef} value={input} onChange={e=>{setInput(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder={v.listening?"Listening…":"Type your response…"} disabled={loading||inputDisabled} rows={1} style={{flex:1,resize:"none",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 13px",fontSize:14,fontFamily:"Georgia,serif",lineHeight:1.5,outline:"none",overflow:"hidden",color:"#2d3748",background:"#f8f7f4"}}/>
         <button onClick={send} disabled={loading||!input.trim()||inputDisabled} style={{background:loading||!input.trim()||inputDisabled?"#e2e8f0":"#4a7c59",color:loading||!input.trim()||inputDisabled?"#a0aec0":"#fff",border:"none",borderRadius:10,padding:"10px 18px",fontSize:13,cursor:"pointer",fontFamily:"Georgia,serif"}}>Send</button>
       </div>
     </div>

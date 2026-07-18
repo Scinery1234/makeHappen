@@ -46,3 +46,18 @@ The coaching hub and the task assistant now live behind **one AI Hub**:
 - Made the Executive Function Coach also push captured tasks into the shared
   store, so coaching and task management share one list — mirroring the
   production integration.
+
+## Voice mode
+
+Both interfaces now have an optional **voice mode**, built on the browser-native
+Web Speech API (no backend or API key):
+
+- **Read aloud** — coach/assistant replies are spoken as they arrive, with a
+  choice of the system's installed voices and an adjustable speed.
+- **Dictation** — a mic button turns speech into text in the composer (where the
+  browser supports speech recognition).
+- Preferences (on/off, chosen voice, speed) persist locally and apply across
+  every coach. Sending a new message barges in and stops playback.
+
+In this prototype it lives in the shared `Chat` shell (`useVoice`); in the app it
+lives in `frontend/src/hooks/useVoice.js` and the `AIHub` conversation header.
