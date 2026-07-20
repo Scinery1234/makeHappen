@@ -18,6 +18,35 @@ const api = async (messages, system, retries=2, delay=1500) => {
 const now = () => new Date().toLocaleTimeString("en-AU",{hour:"2-digit",minute:"2-digit"});
 const bold = t => t.split(/(\*\*[^*]+\*\*)/g).map((p,i)=>p.startsWith("**")&&p.endsWith("**")?<strong key={i}>{p.slice(2,-2)}</strong>:p);
 
+// ── VOICE MODE ───────────────────────────────────────────────────────────────
+// Browser-native text-to-speech (with a choice of voices) + speech-to-text
+// dictation via the Web Speech API. No backend or API key — same idea as the
+// production app's voice mode, so coaching can be listened to and spoken to.
+const _synth = typeof window!=="undefined" ? window.speechSynthesis : null;
+const _SR = typeof window!=="undefined" ? (window.SpeechRecognition||window.webkitSpeechRecognition) : null;
+const speakable = t => (t||"").replace(/\*\*/g,"").replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu,"").replace(/\s+/g," ").trim();
+
+function useVoice(){
+  const [voices,setVoices]=useState([]);
+  const [enabled,setEnabled]=useState(()=>{try{return localStorage.getItem("pf_voice_on")==="1";}catch{return false;}});
+  const [voiceURI,setURI]=useState(()=>{try{return localStorage.getItem("pf_voice_uri")||"";}catch{return "";}});
+  const [rate,setRateS]=useState(()=>{try{return parseFloat(localStorage.getItem("pf_voice_rate"))||1;}catch{return 1;}});
+  const [speaking,setSpeaking]=useState(false);const [listening,setListening]=useState(false);
+  const recRef=useRef(null);
+
+  useEffect(()=>{if(!_synth)return;const load=()=>{const all=_synth.getVoices()||[];const en=all.filter(v=>/^en([-_]|$)/i.test(v.lang));setVoices(en.length?en:all);};load();if(_synth.addEventListener)_synth.addEventListener("voiceschanged",load);return()=>{if(_synth.removeEventListener)_synth.removeEventListener("voiceschanged",load);};},[]);
+  const set=(k,val,f)=>{f(val);try{localStorage.setItem(k,val);}catch{}};
+  const setVoiceURI=u=>set("pf_voice_uri",u,setURI);
+  const setRate=r=>set("pf_voice_rate",String(r),v=>setRateS(parseFloat(v)));
+  const stop=()=>{if(_synth)_synth.cancel();setSpeaking(false);};
+  const speak=t=>{if(!_synth)return;const body=speakable(t);if(!body)return;_synth.cancel();const u=new SpeechSynthesisUtterance(body);const v=(_synth.getVoices()||[]).find(x=>x.voiceURI===voiceURI);if(v){u.voice=v;u.lang=v.lang;}u.rate=rate;u.onstart=()=>setSpeaking(true);u.onend=()=>setSpeaking(false);u.onerror=()=>setSpeaking(false);_synth.speak(u);};
+  const toggle=()=>setEnabled(p=>{const n=!p;try{localStorage.setItem("pf_voice_on",n?"1":"0");}catch{}if(!n&&_synth)_synth.cancel();return n;});
+  const listen=onFinal=>{if(!_SR)return;try{const r=new _SR();r.lang="en-AU";r.interimResults=false;r.maxAlternatives=1;r.onresult=e=>{const t=e.results?.[0]?.[0]?.transcript||"";if(t)onFinal(t);};r.onend=()=>setListening(false);r.onerror=()=>setListening(false);recRef.current=r;setListening(true);r.start();}catch{setListening(false);}};
+  const stopListen=()=>{try{recRef.current?.stop();}catch{}setListening(false);};
+  useEffect(()=>()=>{if(_synth)_synth.cancel();try{recRef.current?.abort?.();}catch{}},[]);
+  return {supported:!!_synth,sttSupported:!!_SR,voices,enabled,toggle,voiceURI,setVoiceURI,rate,setRate,speaking,speak,stop,listening,listen,stopListen};
+}
+
 const TOOLS = [
   {id:"cbt",icon:"🌿",name:"CBT Coach",desc:"A structured 10-step CBT session to work through what's troubling you."},
   {id:"action",icon:"⚡",name:"Action Coach",desc:"For when you know what to do but can't start. Uncover resistance, rebuild momentum."},
@@ -26,6 +55,14 @@ const TOOLS = [
   {id:"clarity",icon:"🧿",name:"Clarity Compass",desc:"A guided process for decisions that actually feel like yours."},
 
 ];
+
+// Shared task store — the "AI addon" the coaching hub integrates with. In the
+// production app (MadeHappen / ZTD) this is the real task list behind /api/coach;
+// here it's persisted locally so the prototype demonstrates the same behaviour:
+// coaches capture next steps straight into the tasks the assistant manages.
+const TASKS_KEY = "pf_tasks";
+async function loadTasks(){try{const r=await window.storage.get(TASKS_KEY);if(r?.value)return JSON.parse(r.value);}catch{}return [];}
+async function saveTasks(t){try{await window.storage.set(TASKS_KEY,JSON.stringify(t));}catch{}return t;}
 
 // ── CRISIS OVERLAY ─────────────────────────────────────────────────────────
 function CrisisOverlay({onClose}){
@@ -86,8 +123,12 @@ function ConsentGate({onAccept,onCrisis}){
 // ── CHAT SHELL ─────────────────────────────────────────────────────────────
 function Chat({header,children,messages,input,setInput,onSend,loading,onCrisis,inputDisabled}){
   const bottomRef=useRef(null);const inputRef=useRef(null);
+  const v=useVoice();const [showVoice,setShowVoice]=useState(false);const spokenRef=useRef(0);
   useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[messages,loading]);
-  const send=()=>{if(!input.trim()||loading||inputDisabled)return;onSend(input.trim());setInput("");};
+  // Read each new assistant message aloud when voice mode is on.
+  useEffect(()=>{if(!v.enabled)return;const last=messages[messages.length-1];if(last&&last.role==="assistant"&&messages.length>spokenRef.current){spokenRef.current=messages.length;v.speak(last.text||last.content);}},[messages,v.enabled]);
+  const send=()=>{if(!input.trim()||loading||inputDisabled)return;v.stop();onSend(input.trim());setInput("");};
+  const vbtn={background:"none",border:"1px solid #e2e8f0",borderRadius:8,padding:"6px 10px",fontSize:13,cursor:"pointer",fontFamily:"Georgia,serif",color:"#4a5568"};
   return(
     <div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"Georgia,serif",maxWidth:700,margin:"0 auto"}}>
       {header}
@@ -104,8 +145,21 @@ function Chat({header,children,messages,input,setInput,onSend,loading,onCrisis,i
         {children}
         <div ref={bottomRef}/>
       </div>
+      {v.supported&&showVoice&&(
+        <div style={{padding:"10px 14px",borderTop:"1px solid #eef0f2",background:"#faf9f7",display:"flex",flexWrap:"wrap",gap:10,alignItems:"center"}}>
+          <button onClick={v.toggle} style={{...vbtn,background:v.enabled?"#4a7c59":"none",color:v.enabled?"#fff":"#4a5568",border:v.enabled?"1px solid #4a7c59":"1px solid #e2e8f0"}}>{v.enabled?"🔈 Voice on":"🔇 Voice off"}</button>
+          <select value={v.voiceURI} onChange={e=>v.setVoiceURI(e.target.value)} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"6px 8px",fontSize:13,fontFamily:"Georgia,serif",color:"#2d3748",background:"#fff",maxWidth:180}}>
+            <option value="">Default voice</option>
+            {v.voices.map(vo=><option key={vo.voiceURI} value={vo.voiceURI}>{vo.name}{vo.lang?` (${vo.lang})`:""}</option>)}
+          </select>
+          <label style={{fontSize:12,color:"#718096",display:"flex",alignItems:"center",gap:6}}>Speed<input type="range" min="0.7" max="1.3" step="0.05" value={v.rate} onChange={e=>v.setRate(e.target.value)} style={{accentColor:"#4a7c59"}}/></label>
+          <button onClick={()=>v.speaking?v.stop():v.speak("Hi, this is how I sound.")} style={vbtn}>{v.speaking?"⏹ Stop":"▶ Preview"}</button>
+        </div>
+      )}
       <div style={{padding:"12px 14px",borderTop:"1px solid #e2e8f0",background:"#fff",display:"flex",gap:10,alignItems:"flex-end"}}>
-        <textarea ref={inputRef} value={input} onChange={e=>{setInput(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Type your response…" disabled={loading||inputDisabled} rows={1} style={{flex:1,resize:"none",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 13px",fontSize:14,fontFamily:"Georgia,serif",lineHeight:1.5,outline:"none",overflow:"hidden",color:"#2d3748",background:"#f8f7f4"}}/>
+        {v.supported&&<button onClick={()=>setShowVoice(s=>!s)} title="Voice options" style={{background:showVoice?"#eef2ef":"none",border:"1px solid #e2e8f0",borderRadius:10,padding:"10px 12px",fontSize:15,cursor:"pointer"}}>{v.enabled?"🔈":"🔊"}</button>}
+        {v.sttSupported&&<button onClick={()=>v.listening?v.stopListen():v.listen(t=>setInput(input?`${input} ${t}`:t))} title={v.listening?"Stop":"Speak"} disabled={loading||inputDisabled} style={{background:v.listening?"#e05252":"none",border:v.listening?"1px solid #e05252":"1px solid #e2e8f0",color:v.listening?"#fff":"#4a5568",borderRadius:10,padding:"10px 12px",fontSize:15,cursor:"pointer"}}>{v.listening?"⏺":"🎤"}</button>}
+        <textarea ref={inputRef} value={input} onChange={e=>{setInput(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,120)+"px";}} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder={v.listening?"Listening…":"Type your response…"} disabled={loading||inputDisabled} rows={1} style={{flex:1,resize:"none",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 13px",fontSize:14,fontFamily:"Georgia,serif",lineHeight:1.5,outline:"none",overflow:"hidden",color:"#2d3748",background:"#f8f7f4"}}/>
         <button onClick={send} disabled={loading||!input.trim()||inputDisabled} style={{background:loading||!input.trim()||inputDisabled?"#e2e8f0":"#4a7c59",color:loading||!input.trim()||inputDisabled?"#a0aec0":"#fff",border:"none",borderRadius:10,padding:"10px 18px",fontSize:13,cursor:"pointer",fontFamily:"Georgia,serif"}}>Send</button>
       </div>
     </div>
@@ -217,7 +271,13 @@ function ExecCoach({onBack,onCrisis}){
       const r=await api(next.map(m=>({role:m.role,content:m.text||m.content})),EXEC_SYS);
       setMsgs(p=>[...p,{role:"assistant",text:r,ts:now()}]);
       const raw=await api([{role:"user",content:`From this exchange, extract any tasks or intentions mentioned. Return ONLY a JSON array of short strings, or [].\n\nUser: ${text}\nCoach: ${r}`}],"Extract tasks. Return ONLY a JSON array. No markdown.");
-      try{const items=JSON.parse(raw);if(items.length)saveList([...new Set([...checklist,...items])]);}catch{}
+      try{const items=JSON.parse(raw);if(items.length){saveList([...new Set([...checklist,...items])]);
+        // Integration: also push captured tasks into the shared task store the
+        // Task Assistant manages, so they're actionable in one place.
+        const cur=await loadTasks();const have=new Set(cur.map(t=>(t.text||"").toLowerCase()));
+        const fresh=items.filter(x=>x&&!have.has(String(x).toLowerCase())).map(x=>({text:String(x),done:false}));
+        if(fresh.length)await saveTasks([...cur,...fresh]);
+      }}catch{}
     }catch{setMsgs(p=>[...p,{role:"assistant",text:"Something went wrong.",ts:now()}]);}
     setLoading(false);
   };
@@ -246,7 +306,7 @@ function ExecCoach({onBack,onCrisis}){
 }
 
 // ── REDUCING THE CHARGE ────────────────────────────────────────────────────
-const CHARGE_SYS=`You are 'Reducing the Charge,' a therapeutic guide helping users process emotional resistance. Integrate ACT, ULH, UFT, Exposure Therapy, CBT, Mindfulness. Never directive — gently invite. One question at a time. 3-4 lines per prompt. Begin by asking the user to rate their emotional charge 1-10.${SAFETY}`;
+const CHARGE_SYS=`You are 'Reducing the Charge,' a therapeutic guide with one job: helping the user lower the emotional charge they are carrying right now. Integrate ACT, ULH, UFT, Exposure Therapy, CBT, Mindfulness. Never directive — gently invite. One question at a time. 3-4 lines per prompt. Begin by asking the user to rate their emotional charge 1-10. Stay with the charge itself — keep the user with the felt sensation in the body and the emotion underneath it, not the backstory, the causes, or fixing the situation. If they drift into problem-solving, analysis, or storytelling, warmly acknowledge it in a sentence and guide them back to what they are feeling in this moment. Every few exchanges, invite them to notice and re-rate the charge (1-10) so you both track whether it is settling. Only once the charge has clearly eased should you gently close.${SAFETY}`;
 
 function ChargeCoach({onBack,onCrisis}){
   const [msgs,setMsgs]=useState([{role:"assistant",text:"Welcome. Before we begin, you might like to put your phone on silent to give this space some quiet.\n\nWhenever you're ready: on a scale of 1 to 10, how would you rate the emotional charge you're carrying right now?",ts:now()}]);
@@ -332,15 +392,76 @@ function ClarityCoach({onBack,onCrisis}){
 
 
 
+// ── TASK ASSISTANT (the AI addon) ───────────────────────────────────────────
+// Natural-language add / complete / delete over the shared task store. This is
+// the "AI addon" the coaching hub integrates with — the same idea as
+// MadeHappen's /api/chat assistant, so tasks captured in coaching are actionable
+// in the same place.
+const ASSIST_SYS=`You manage a user's to-do list through natural language. Given the CURRENT TASKS and the user's message, decide what to change. Respond ONLY with JSON: {"reply":"one short friendly sentence","add":["task text",...],"complete":[index,...],"delete":[index,...]}. Indices are 0-based into CURRENT TASKS. Use empty arrays when nothing changes. No markdown, no prose outside the JSON.`;
+
+function TaskAssistant({onBack,onCrisis}){
+  const [tasks,setTasks]=useState([]);
+  const [msgs,setMsgs]=useState([{role:"assistant",text:"Hi! I can add, complete and delete your tasks. Try “add buy milk and call the dentist” or “delete the second one”.",ts:now()}]);
+  const [input,setInput]=useState("");const [loading,setLoading]=useState(false);const [showList,setShowList]=useState(true);
+
+  useEffect(()=>{(async()=>{setTasks(await loadTasks());})();},[]);
+  const persist=async t=>{setTasks(t);await saveTasks(t);};
+
+  const send=async text=>{
+    if(detectCrisis(text))onCrisis();
+    const um={role:"user",text,ts:now()};setMsgs(p=>[...p,um]);setLoading(true);
+    const listStr=tasks.length?tasks.map((t,i)=>`${i}. ${t.text}${t.done?" (done)":""}`).join("\n"):"(empty)";
+    try{
+      const raw=await api([{role:"user",content:`CURRENT TASKS:\n${listStr}\n\nMESSAGE: ${text}`}],ASSIST_SYS);
+      let a={reply:"Done.",add:[],complete:[],delete:[]};
+      try{a={...a,...JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0]||raw)};}catch{}
+      let next=tasks.map(t=>({...t}));
+      (a.complete||[]).forEach(i=>{if(next[i])next[i].done=true;});
+      next=next.filter((_,i)=>!(a.delete||[]).includes(i));
+      (a.add||[]).forEach(txt=>{if(txt&&txt.trim())next.push({text:txt.trim(),done:false});});
+      await persist(next);
+      setMsgs(p=>[...p,{role:"assistant",text:a.reply||"Done.",ts:now()}]);
+    }catch{setMsgs(p=>[...p,{role:"assistant",text:"Something went wrong.",ts:now()}]);}
+    setLoading(false);
+  };
+
+  const open=tasks.filter(t=>!t.done).length;
+  const extra=<button onClick={()=>setShowList(s=>!s)} style={{fontSize:12,color:"#666",background:"none",border:"1px solid #ddd",borderRadius:6,padding:"4px 10px",cursor:"pointer",position:"relative"}}>{showList?"Hide list":"My tasks"}{open>0&&<span style={{position:"absolute",top:-6,right:-6,background:"#f97316",color:"white",borderRadius:999,fontSize:10,padding:"1px 5px"}}>{open}</span>}</button>;
+
+  return(
+    <Chat header={<Hdr icon="✨" name="Task Assistant" sub="Add · complete · delete" extra={extra} onBack={onBack} onCrisis={onCrisis}/>} messages={msgs} input={input} setInput={setInput} onSend={send} loading={loading} onCrisis={onCrisis}>
+      {showList&&(
+        <div style={{background:"#fff8f1",border:"1px solid #f4dcc4",borderRadius:10,padding:14,margin:"4px 0"}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#9a6b3f",letterSpacing:0.5,marginBottom:8}}>YOUR TASKS</div>
+          {tasks.length===0&&<div style={{fontSize:13,color:"#bbb",fontStyle:"italic"}}>No tasks yet. Add some, or let a coach capture them for you.</div>}
+          {tasks.map((item,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:7}}>
+              <input type="checkbox" checked={!!item.done} onChange={()=>persist(tasks.map((x,j)=>j===i?{...x,done:!x.done}:x))} style={{accentColor:"#f97316",cursor:"pointer"}}/>
+              <span style={{fontSize:13,flex:1,textDecoration:item.done?"line-through":"none",color:item.done?"#bbb":"#2c2c2c"}}>{item.text}</span>
+              <button onClick={()=>persist(tasks.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:"#ddd",cursor:"pointer",fontSize:14}}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Chat>
+  );
+}
+
 // ── HOME ───────────────────────────────────────────────────────────────────
 function Home({onSelect,onCrisis}){
   return(
     <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",fontFamily:"Georgia,serif",background:"#f8f7f4"}}>
       <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"32px 20px"}}>
         <div style={{fontSize:11,letterSpacing:2,color:"#a0aec0",textTransform:"uppercase",marginBottom:10}}>Purposefields</div>
-        <h1 style={{fontSize:24,fontWeight:600,color:"#2d3748",marginBottom:8}}>Coaching Hub</h1>
-        <p style={{color:"#718096",fontSize:14,marginBottom:36,textAlign:"center",maxWidth:360,lineHeight:1.7}}>Choose a coaching space. Each session is private and learns from you over time.</p>
+        <h1 style={{fontSize:24,fontWeight:600,color:"#2d3748",marginBottom:8}}>AI Hub</h1>
+        <p style={{color:"#718096",fontSize:14,marginBottom:36,textAlign:"center",maxWidth:380,lineHeight:1.7}}>Manage your tasks, or step into a coaching space. Coaches capture next steps straight into your task list.</p>
         <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%",maxWidth:440}}>
+          <button onClick={()=>onSelect("assistant")} style={{display:"flex",alignItems:"center",gap:14,padding:"16px 18px",background:"linear-gradient(135deg,#fff7ed,#ffffff)",border:"1px solid #f4c99a",borderRadius:12,cursor:"pointer",textAlign:"left",boxShadow:"0 1px 3px rgba(0,0,0,0.05)"}}>
+            <span style={{fontSize:24,lineHeight:1,flexShrink:0}}>✨</span>
+            <div style={{flex:1}}><div style={{fontWeight:600,fontSize:14,color:"#2d3748",marginBottom:2}}>Task Assistant</div><div style={{fontSize:13,color:"#718096",lineHeight:1.6}}>Add, complete and organise your tasks in plain language.</div></div>
+            <span style={{fontSize:18,color:"#f97316"}}>→</span>
+          </button>
+          <div style={{fontSize:11,fontWeight:600,letterSpacing:1,color:"#a0aec0",textTransform:"uppercase",margin:"8px 2px 2px"}}>Coaching, resilience & focus</div>
           {TOOLS.map(t=>(
             <button key={t.id} onClick={()=>onSelect(t.id)} style={{display:"flex",alignItems:"flex-start",gap:14,padding:"16px 18px",background:"white",border:"1px solid #e2e8f0",borderRadius:12,cursor:"pointer",textAlign:"left",boxShadow:"0 1px 3px rgba(0,0,0,0.05)"}}>
               <span style={{fontSize:24,lineHeight:1,flexShrink:0}}>{t.icon}</span>
@@ -384,6 +505,7 @@ export default function App(){
     <>
       {crisis&&<CrisisOverlay onClose={()=>setCrisis(false)}/>}
       {screen==="home"&&<Home onSelect={setScreen} onCrisis={()=>setCrisis(true)}/>}
+      {screen==="assistant"&&<TaskAssistant {...cp}/>}
       {screen==="cbt"&&<CBTCoach {...cp}/>}
       {screen==="action"&&<ActionCoach {...cp}/>}
       {screen==="exec"&&<ExecCoach {...cp}/>}
