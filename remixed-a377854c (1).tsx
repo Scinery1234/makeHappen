@@ -7,8 +7,17 @@ const detectCrisis = t => CRISIS_KW.some(k => t.toLowerCase().includes(k));
 const CRISIS_RES = [{name:"Lifeline",num:"13 11 14",desc:"24/7 crisis support"},{name:"Beyond Blue",num:"1300 22 4636",desc:"Mental health support"},{name:"Emergency",num:"000",desc:"Immediate danger"},{name:"13YARN",num:"13 92 76",desc:"Aboriginal & Torres Strait Islander"}];
 const SAFETY = `\n\nSAFETY: If user expresses suicidal ideation, self-harm, or crisis — acknowledge warmly and provide: Lifeline 13 11 14, Beyond Blue 1300 22 4636, Emergency 000. This tool does not replace professional mental health care.`;
 
+const dateTimeContext = () => {
+  const d = new Date();
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const dateStr = d.toLocaleDateString("en-AU",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
+  const timeStr = d.toLocaleTimeString("en-AU",{hour:"2-digit",minute:"2-digit",hour12:true});
+  return `\n\nCURRENT DATE & TIME: ${dateStr}, ${timeStr} (${tz}). This is accurate real-world information — use it instead of any date you might otherwise assume.`;
+};
+
 const api = async (messages, system, retries=2, delay=1500) => {
-  const res = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:900,system,messages})});
+  const systemWithTime = `${system}${dateTimeContext()}`;
+  const res = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:900,system:systemWithTime,messages})});
   const d = await res.json();
   if (res.status===529&&retries>0){await new Promise(r=>setTimeout(r,delay));return api(messages,system,retries-1,delay*1.5);}
   if (!res.ok) throw new Error(`API ${res.status}`);
